@@ -1,0 +1,12 @@
+# Copy this file to integration-test.properties (same directory) and fill in your credentials.
+# integration-test.properties is gitignored and will never be committed.
+
+# Snowflake JDBC connection
+# Format: jdbc:snowflake://<account>.snowflakecomputing.com/
+snowflake.jdbc.url=jdbc:snowflake://<account>.snowflakecomputing.com/
+snowflake.user=<your_user>
+snowflake.password=<your_password>
+
+# Trino JDBC connection (local Docker, no auth required)
+# Format: jdbc:trino://localhost:8080
+trino.jdbc.url=jdbc:trino://localhost:8080

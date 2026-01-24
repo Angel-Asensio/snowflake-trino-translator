@@ -1,0 +1,18 @@
+# Maven build output
+target/
+
+# IntelliJ IDEA files
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# macOS system files
+.DS_Store
+
+# Claude / AI assistant files
+.claude/
+CLAUDE.md
+
+# Integration test credentials (never commit)
+src/test/resources/integration-test.properties
