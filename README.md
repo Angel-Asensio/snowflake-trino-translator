@@ -108,7 +108,7 @@ Input Snowflake SQL
 | `DATEADD(unit, n, date)` | `date_add('unit', n, date)` | Unit identifier → string literal |
 | `DATEDIFF(unit, start, end)` | `date_diff('unit', start, end)` | Unit identifier → string literal |
 | `TO_DATE(str)` | `CAST(str AS DATE)` | |
-| `TO_DATE(str, format)` | `date_parse(str, format)` | Format string converted (see below) |
+| `TO_DATE(str, format)` | `CAST(date_parse(str, format) AS DATE)` | Format string converted (see below); wrapped in CAST to return DATE not TIMESTAMP |
 | `TO_TIMESTAMP(str)` | `CAST(str AS TIMESTAMP)` | |
 | `SYSDATE()` / `GETDATE()` | `now()` | |
 | `CURRENT_DATE()` | `CURRENT_DATE` | Trailing parens stripped before parsing |
@@ -155,7 +155,7 @@ Input Snowflake SQL
 | `NVL2(expr, not_null, null_val)` | `IF(expr IS NOT NULL, not_null, null_val)` | |
 | `ZEROIFNULL(x)` | `COALESCE(x, 0)` | |
 | `NULLIFZERO(x)` | `NULLIF(x, 0)` | |
-| `DIV0(x, y)` | `IF(y = 0, 0, x / y)` | Returns 0 on divide-by-zero |
+| `DIV0(x, y)` | `IF(y = 0, CAST(0 AS DOUBLE), CAST(x AS DOUBLE) / y)` | Returns 0.0 on divide-by-zero; both operands cast to DOUBLE to match Snowflake's floating-point return type |
 | `DECODE(expr, s1,r1, s2,r2, …, default)` | `CASE WHEN expr=s1 THEN r1 … ELSE default END` | Arbitrary number of search/result pairs |
 
 ### String
@@ -165,14 +165,14 @@ Input Snowflake SQL
 | `LEFT(str, n)` | `substr(str, 1, n)` | |
 | `RIGHT(str, n)` | `substr(str, length(str)-n+1, n)` | |
 | `STARTSWITH(str, prefix)` | `starts_with(str, prefix)` | |
-| `ENDSWITH(str, suffix)` | `ends_with(str, suffix)` | |
+| `ENDSWITH(str, suffix)` | `substr(str, length(str)-length(suffix)+1) = suffix` | SQL-standard expression for compatibility with older Trino versions |
 | `CONTAINS(str, sub)` | `strpos(str, sub) > 0` | String containment; distinct from `ARRAY_CONTAINS` |
 | `INSTR(str, sub)` | `strpos(str, sub)` | |
 | `CHARINDEX(sub, str)` | `strpos(str, sub)` | Argument order reversed |
 | `REGEXP_SUBSTR(str, pat)` | `regexp_extract(str, pat)` | Extra args dropped with warning |
 | `STRTOK(str, delim, n)` | `split_part(str, delim, n)` | |
 | `EDITDISTANCE(s1, s2)` | `levenshtein_distance(s1, s2)` | |
-| `SPACE(n)` | `repeat(' ', n)` | |
+| `SPACE(n)` | `rpad('', n, ' ')` | `repeat(' ', n)` resolves to the array overload in Trino for char literals |
 
 ### Hash / Encoding
 
@@ -198,13 +198,13 @@ Input Snowflake SQL
 
 | Snowflake | Trino | Notes |
 |-----------|-------|-------|
-| `SQUARE(x)` | `power(x, 2)` | |
+| `SQUARE(x)` | `x * x` | Multiplication preserves integer type; `power(x, 2)` returns DOUBLE in Trino |
 | `TRUNC(x)` | `truncate(x)` | |
 | `TRUNC(x, scale)` | `truncate(x, scale)` | |
 | `CEIL(x)` | `ceil(x)` | |
-| `CEIL(x, scale)` | `ceil(x)` | Scale argument dropped with warning |
+| `CEIL(x, scale)` | `ceil(x)` | Scale argument silently dropped |
 | `FLOOR(x)` | `floor(x)` | |
-| `FLOOR(x, scale)` | `floor(x)` | Scale argument dropped with warning |
+| `FLOOR(x, scale)` | `floor(x)` | Scale argument silently dropped |
 | `BITAND(x, y)` | `bitwise_and(x, y)` | |
 | `BITOR(x, y)` | `bitwise_or(x, y)` | |
 | `BITXOR(x, y)` | `bitwise_xor(x, y)` | |
@@ -239,7 +239,7 @@ Input Snowflake SQL
 | `BITAND_AGG(x)` | `bitwise_and_agg(x)` | |
 | `BITOR_AGG(x)` | `bitwise_or_agg(x)` | |
 | `BITXOR_AGG(x)` | `bitwise_xor_agg(x)` | |
-| `SKEW(x)` | `skewness(x)` | |
+| `SKEW(x)` | `CASE WHEN count(x) <= 2 THEN NULL ELSE skewness(x) * sqrt(count(x) * (count(x)-1)) / (count(x)-2) END` | Applies the adjusted Fisher-Pearson bias correction to match Snowflake's G1 skewness; returns NULL for n ≤ 2 |
 
 ### Window
 
@@ -304,7 +304,7 @@ SELECT
   "date_add"('month', 1, "signup_date")                 AS "next_billing",
   "date_diff"('day', "signup_date", CURRENT_DATE)       AS "days_since_signup",
   "date_add"('month', 3, "billing_date")                AS "q_ahead",
-  "date_parse"("date_str", '%Y/%m/%d')                  AS "parsed_date",
+  CAST("date_parse"("date_str", '%Y/%m/%d') AS DATE)     AS "parsed_date",
   "last_day_of_month"("billing_date")                   AS "period_end",
   "format_datetime"("event_date", 'EEEE')               AS "day_label",
   "format_datetime"("event_date", 'MMMM')               AS "month_label"
@@ -324,7 +324,7 @@ FROM stats;
 
 -- Trino
 SELECT
-  IF("num_transactions" = 0, 0, "total_sales" / "num_transactions") AS "avg_sale",
+  IF("num_transactions" = 0, CAST(0 AS DOUBLE), CAST("total_sales" AS DOUBLE) / "num_transactions") AS "avg_sale",
   CAST("revenue_str" AS DECIMAL)                                      AS "revenue",
   CAST("ratio_str" AS DOUBLE)                                         AS "ratio",
   CAST("active_str" AS BOOLEAN)                                       AS "is_active"
@@ -351,7 +351,7 @@ SELECT
   "substr"("full_name", 1, 1)                                     AS "initial",
   "substr"("account_code", "length"("account_code") - 4 + 1, 4)  AS "suffix",
   "levenshtein_distance"("name_a", "name_b")                      AS "edit_dist",
-  "repeat"(' ', 4)                                                 AS "padding",
+  "rpad"('', 4, ' ')                                               AS "padding",
   "lower"("to_hex"("md5"("to_utf8"("password_col"))))             AS "password_hash",
   "lower"("to_hex"("sha256"("to_utf8"("secret"))))                AS "secret_hash",
   "lower"("to_hex"("to_utf8"("raw_bytes")))                       AS "hex_str",
@@ -420,7 +420,7 @@ SELECT
   ANY_VALUE(manager_name)          AS a_manager,
   APPROX_COUNT_DISTINCT(user_id)   AS approx_users,
   MEDIAN(salary)                   AS p50_salary,
-  SKEW(response_ms)                AS latency_skew,
+  KURTOSIS(response_ms)            AS latency_kurtosis,
   BOOLAND_AGG(is_verified)         AS all_verified,
   BOOLOR_AGG(has_error)            AS any_error,
   BOOLXOR_AGG(is_flagged)          AS odd_flags,
@@ -434,7 +434,7 @@ SELECT
   "arbitrary"("manager_name")                   AS "a_manager",
   "approx_distinct"("user_id")                  AS "approx_users",
   "approx_percentile"("salary", 0.5)            AS "p50_salary",
-  "skewness"("response_ms")                     AS "latency_skew",
+  "kurtosis"("response_ms")                     AS "latency_kurtosis",
   "bool_and"("is_verified")                     AS "all_verified",
   "bool_or"("has_error")                        AS "any_error",
   ("count_if"("is_flagged") % 2) = 1            AS "odd_flags",

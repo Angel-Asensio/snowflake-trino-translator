@@ -9,80 +9,94 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Main translator class for converting Snowflake SQL to Trino SQL.
- * Uses Apache Calcite for parsing and transformation.
+ * Public API for translating Snowflake SQL to Trino SQL.
+ *
+ * <p>Uses Apache Calcite's Babel parser to build an AST, transforms it via
+ * {@link SnowflakeToTrinoConverter}, then renders it with {@link TrinoSqlDialect}.
+ *
+ * <h3>Usage</h3>
+ * <pre>{@code
+ * SnowflakeTrinoTranslator translator = new SnowflakeTrinoTranslator();
+ *
+ * // Simple — just the SQL string:
+ * String trinoSql = translator.translate(snowflakeSql);
+ *
+ * // With diagnostics — SQL + structured warnings:
+ * TranslationResult result = translator.translateWithDiagnostics(snowflakeSql);
+ * if (result.hasWarnings()) {
+ *     result.warnings().forEach(w -> log.warn("{}: {}", w.functionName(), w.message()));
+ * }
+ * }</pre>
  */
 public class SnowflakeTrinoTranslator {
-    
+
     private static final Logger logger = LoggerFactory.getLogger(SnowflakeTrinoTranslator.class);
-    
+
     private final SqlParser.Config parserConfig;
     private final TrinoSqlDialect trinoDialect;
     private final SnowflakeToTrinoConverter converter;
-    
+
     public SnowflakeTrinoTranslator() {
         this.parserConfig = SqlParser.config()
                 .withParserFactory(SqlBabelParserImpl.FACTORY)
                 .withLex(Lex.MYSQL)
                 .withCaseSensitive(false);
-        
         this.trinoDialect = new TrinoSqlDialect();
         this.converter = new SnowflakeToTrinoConverter();
     }
-    
+
     /**
-     * Translates Snowflake SQL to Trino SQL.
+     * Returns the underlying {@link SnowflakeToTrinoConverter}, allowing callers to register
+     * custom function converters via {@link SnowflakeToTrinoConverter#register(String, FunctionConverter)}.
+     */
+    public SnowflakeToTrinoConverter getConverter() {
+        return converter;
+    }
+
+    /**
+     * Translates Snowflake SQL to Trino SQL, returning only the translated string.
      *
-     * @param snowflakeSql The input Snowflake SQL query
-     * @return The translated Trino SQL query
-     * @throws SqlTranslationException if translation fails
+     * <p>For structured access to warnings about dropped arguments or unsupported features,
+     * use {@link #translateWithDiagnostics(String)} instead.
+     *
+     * @param snowflakeSql the input Snowflake SQL query
+     * @return the translated Trino SQL string
+     * @throws SqlTranslationException if parsing or transformation fails
      */
     public String translate(String snowflakeSql) throws SqlTranslationException {
+        return translateWithDiagnostics(snowflakeSql).sql();
+    }
+
+    /**
+     * Translates Snowflake SQL to Trino SQL, returning both the translated string and
+     * any warnings accumulated during translation (e.g. dropped arguments, approximate translations).
+     *
+     * @param snowflakeSql the input Snowflake SQL query
+     * @return a {@link TranslationResult} containing the Trino SQL and any warnings
+     * @throws SqlTranslationException if parsing or transformation fails
+     */
+    public TranslationResult translateWithDiagnostics(String snowflakeSql) throws SqlTranslationException {
         if (snowflakeSql == null || snowflakeSql.trim().isEmpty()) {
             throw new SqlTranslationException("Input SQL cannot be null or empty");
         }
-        
+
         try {
-            // Snowflake accepts quoted time unit strings: DATEADD('day', ...) and DATEDIFF('day', ...).
-            // Calcite's Babel parser only accepts unquoted identifiers in that position.
-            // Normalize before parsing: DATEADD('day', → DATEADD(day,
-            snowflakeSql = snowflakeSql.replaceAll(
-                    "(?i)(DATEADD|DATEDIFF)\\s*\\(\\s*'([A-Za-z_]+)'",
-                    "$1($2");
+            String preprocessed = preprocess(snowflakeSql);
+            logger.debug("Parsing Snowflake SQL: {}", preprocessed);
 
-            // CURRENT_DATE() / CURRENT_TIMESTAMP() with parens: Calcite treats these as SQL keywords
-            // and rejects the empty argument list. Strip the parens before parsing.
-            snowflakeSql = snowflakeSql.replaceAll("(?i)\\bCURRENT_DATE\\s*\\(\\s*\\)", "CURRENT_DATE");
-            snowflakeSql = snowflakeSql.replaceAll("(?i)\\bCURRENT_TIMESTAMP\\s*\\(\\s*\\)", "CURRENT_TIMESTAMP");
-
-            // CEIL/FLOOR with a scale argument and DATE_FROM_PARTS: Calcite routes these through
-            // its special built-in grammar (FloorCeilOptions / DATE keyword) and fails at parse time.
-            // Rename them to internal aliases that are treated as plain user-defined functions.
-            snowflakeSql = snowflakeSql.replaceAll("(?i)\\bCEIL\\s*\\(", "SF_CEIL(");
-            snowflakeSql = snowflakeSql.replaceAll("(?i)\\bFLOOR\\s*\\(", "SF_FLOOR(");
-            snowflakeSql = snowflakeSql.replaceAll("(?i)\\bDATE_FROM_PARTS\\s*\\(", "SF_DATE_FROM_PARTS(");
-
-            logger.debug("Parsing Snowflake SQL: {}", snowflakeSql);
-
-            // Parse the Snowflake SQL into an AST
-            SqlParser parser = SqlParser.create(snowflakeSql, parserConfig);
+            SqlParser parser = SqlParser.create(preprocessed, parserConfig);
             SqlNode sqlNode = parser.parseQuery();
-            
             logger.debug("Parsed AST: {}", sqlNode);
-            
-            // Transform Snowflake-specific constructs to Trino equivalents
+
+            converter.clearWarnings();
             SqlNode transformedNode = converter.convert(sqlNode);
-            
             logger.debug("Transformed AST: {}", transformedNode);
-            
-            // Generate Trino SQL from the transformed AST
+
             String trinoSql = transformedNode.toSqlString(trinoDialect).getSql();
-            
-            logger.debug("Successfully translated SQL");
-            logger.debug("Trino SQL: {}", trinoSql);
-            
-            return trinoSql;
-            
+            logger.debug("Translated Trino SQL: {}", trinoSql);
+
+            return new TranslationResult(trinoSql, converter.getWarnings());
+
         } catch (SqlParseException e) {
             logger.error("Failed to parse Snowflake SQL", e);
             throw new SqlTranslationException("Failed to parse Snowflake SQL: " + e.getMessage(), e);
@@ -91,28 +105,44 @@ public class SnowflakeTrinoTranslator {
             throw new SqlTranslationException("Failed to translate SQL: " + e.getMessage(), e);
         }
     }
-    
+
     /**
-     * Main method for command-line usage.
+     * Applies text-level normalizations required before Calcite can parse the SQL.
+     *
+     * <p>These transformations work around three classes of Calcite parser limitations:
+     *
+     * <ol>
+     *   <li><b>Quoted time-unit strings</b> — Snowflake accepts {@code DATEADD('day', ...)} and
+     *       {@code DATEDIFF('day', ...)} with the unit as a quoted string literal. Calcite's Babel
+     *       parser only accepts an unquoted identifier in that position, so the quotes are stripped.
+     *
+     *   <li><b>CURRENT_DATE() / CURRENT_TIMESTAMP() with empty parens</b> — Calcite treats these
+     *       as SQL keywords and rejects an empty argument list. The trailing {@code ()} is removed
+     *       before parsing.
+     *
+     *   <li><b>CEIL / FLOOR / DATE_FROM_PARTS as reserved grammar rules</b> — Calcite's parser
+     *       routes {@code CEIL} and {@code FLOOR} through a special FloorCeilOptions grammar rule
+     *       (which does not accept a second scale argument) and routes {@code DATE_FROM_PARTS}
+     *       through DATE keyword handling. All three are renamed to {@code SF_} prefixed aliases
+     *       so they are parsed as plain user-defined functions. The converter handles them under
+     *       their aliased names and outputs the correct Trino function names.
+     * </ol>
      */
-    public static void main(String[] args) {
-        if (args.length < 1) {
-            System.err.println("Usage: java -jar snowflake-trino-translator.jar \"<SQL_QUERY>\"");
-            System.exit(1);
-        }
-        
-        String snowflakeSql = args[0];
-        SnowflakeTrinoTranslator translator = new SnowflakeTrinoTranslator();
-        
-        try {
-            String trinoSql = translator.translate(snowflakeSql);
-            System.out.println("Original Snowflake SQL:");
-            System.out.println(snowflakeSql);
-            System.out.println("\nTranslated Trino SQL:");
-            System.out.println(trinoSql);
-        } catch (SqlTranslationException e) {
-            System.err.println("Translation failed: " + e.getMessage());
-            System.exit(1);
-        }
+    private String preprocess(String sql) {
+        // (1) Strip quotes from time-unit args: DATEADD('day', → DATEADD(day,
+        sql = sql.replaceAll(
+                "(?i)(DATEADD|DATEDIFF)\\s*\\(\\s*'([A-Za-z_]+)'",
+                "$1($2");
+
+        // (2) Strip empty parens from SQL keyword functions
+        sql = sql.replaceAll("(?i)\\bCURRENT_DATE\\s*\\(\\s*\\)", "CURRENT_DATE");
+        sql = sql.replaceAll("(?i)\\bCURRENT_TIMESTAMP\\s*\\(\\s*\\)", "CURRENT_TIMESTAMP");
+
+        // (3) Rename grammar-conflicting functions to plain UDF aliases
+        sql = sql.replaceAll("(?i)\\bCEIL\\s*\\(", "SF_CEIL(");
+        sql = sql.replaceAll("(?i)\\bFLOOR\\s*\\(", "SF_FLOOR(");
+        sql = sql.replaceAll("(?i)\\bDATE_FROM_PARTS\\s*\\(", "SF_DATE_FROM_PARTS(");
+
+        return sql;
     }
 }

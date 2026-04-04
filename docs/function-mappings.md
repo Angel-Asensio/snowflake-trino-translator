@@ -7,7 +7,7 @@
 | `DATEADD(part, n, date)` | `date_add('part', n, date)` | Date part converted to string literal |
 | `DATEDIFF(part, start, end)` | `date_diff('part', start, end)` | Date part converted to string literal |
 | `TO_DATE(str)` | `CAST(str AS DATE)` | Single-arg form |
-| `TO_DATE(str, fmt)` | `date_parse(str, fmt)` | Format string converted: `YYYY→%Y`, `YY→%y`, `MM→%m`, `DD→%d`, `HH24→%H`, `HH12→%I`, `MI→%i`, `SS→%s` |
+| `TO_DATE(str, fmt)` | `CAST(date_parse(str, fmt) AS DATE)` | Format string converted: `YYYY→%Y`, `YY→%y`, `MM→%m`, `DD→%d`, `HH24→%H`, `HH12→%I`, `MI→%i`, `SS→%s`; wrapped in CAST because `date_parse` returns TIMESTAMP |
 | `TO_TIMESTAMP(str)` | `CAST(str AS TIMESTAMP)` | Single-arg only; extra args ignored |
 | `SYSDATE()` | `now()` | |
 | `GETDATE()` | `now()` | |
@@ -49,7 +49,7 @@
 | `IFF(cond, true_val, false_val)` | `IF(cond, true_val, false_val)` | 3-operand only |
 | `ZEROIFNULL(expr)` | `COALESCE(expr, 0)` | |
 | `NULLIFZERO(expr)` | `NULLIF(expr, 0)` | |
-| `DIV0(num, denom)` | `IF(denom = 0, 0, num / denom)` | Safe division; returns 0 on divide-by-zero |
+| `DIV0(num, denom)` | `IF(denom = 0, CAST(0 AS DOUBLE), CAST(num AS DOUBLE) / denom)` | Safe division; returns 0.0 on divide-by-zero; operands cast to DOUBLE to match Snowflake's floating-point return type |
 | `DECODE(expr, v1, r1, v2, r2, ..., default)` | `CASE WHEN expr = v1 THEN r1 WHEN expr = v2 THEN r2 ... ELSE default END` | Converts to searched CASE; optional default |
 
 ## String Functions
@@ -59,7 +59,7 @@
 | `LEFT(str, n)` | `substr(str, 1, n)` | |
 | `RIGHT(str, n)` | `substr(str, length(str) - n + 1, n)` | Index calculation for rightmost chars |
 | `STARTSWITH(str, prefix)` | `starts_with(str, prefix)` | |
-| `ENDSWITH(str, suffix)` | `ends_with(str, suffix)` | |
+| `ENDSWITH(str, suffix)` | `substr(str, length(str) - length(suffix) + 1) = suffix` | SQL-standard expression for compatibility with older Trino versions |
 | `CONTAINS(str, substr)` | `strpos(str, substr) > 0` | String version; returns boolean |
 | `INSTR(str, substr)` | `strpos(str, substr)` | Extra args beyond 2 ignored |
 | `CHARINDEX(substr, str)` | `strpos(str, substr)` | **Arguments reversed**; start position arg dropped |
@@ -68,7 +68,7 @@
 | `REGEXP_SUBSTR(str, pattern, pos, occ, params)` | `regexp_extract(str, pattern)` | pos/occurrence/params dropped with warning |
 | `STRTOK(str, delim, part)` | `split_part(str, delim, part)` | All 3 operands required |
 | `EDITDISTANCE(s1, s2)` | `levenshtein_distance(s1, s2)` | |
-| `SPACE(n)` | `repeat(' ', n)` | |
+| `SPACE(n)` | `rpad('', n, ' ')` | `repeat(' ', n)` resolves to the array overload in Trino for char literals |
 
 ## Cryptographic / Encoding Functions
 
@@ -115,19 +115,19 @@
 | `BITAND_AGG(col)` | `bitwise_and_agg(col)` | |
 | `BITOR_AGG(col)` | `bitwise_or_agg(col)` | |
 | `BITXOR_AGG(col)` | `bitwise_xor_agg(col)` | |
-| `SKEW(col)` | `skewness(col)` | |
+| `SKEW(col)` | `CASE WHEN count(col) <= 2 THEN NULL ELSE skewness(col) * sqrt(count(col) * (count(col) - 1)) / (count(col) - 2) END` | Applies adjusted Fisher-Pearson bias correction to match Snowflake's G1 skewness; returns NULL for n ≤ 2 |
 
 ## Math Functions
 
 | Snowflake | Trino | Notes |
 |-----------|-------|-------|
-| `SQUARE(n)` | `power(n, 2)` | |
+| `SQUARE(n)` | `n * n` | Multiplication preserves integer type; `power(n, 2)` returns DOUBLE in Trino |
 | `TRUNC(x)` | `truncate(x)` | |
 | `TRUNC(x, scale)` | `truncate(x, scale)` | |
 | `CEIL(x)` | `ceil(x)` | |
-| `CEIL(x, scale)` | `ceil(x)` | Scale argument dropped with warning |
+| `CEIL(x, scale)` | `ceil(x)` | Scale argument silently dropped |
 | `FLOOR(x)` | `floor(x)` | |
-| `FLOOR(x, scale)` | `floor(x)` | Scale argument dropped with warning |
+| `FLOOR(x, scale)` | `floor(x)` | Scale argument silently dropped |
 
 ## Bitwise Functions
 
