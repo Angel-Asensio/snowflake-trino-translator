@@ -5,6 +5,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlBasicTypeNameSpec;
@@ -40,6 +41,11 @@ import org.slf4j.LoggerFactory;
  * <p>Warnings accumulated during a conversion are available via {@link #getWarnings()} after
  * calling {@link #convert(SqlNode)}. Call {@link #clearWarnings()} before each conversion
  * to start with a clean slate.
+ *
+ * <p><b>Thread safety:</b> this class is <em>not</em> thread-safe. It holds mutable warning
+ * state that is reset and read back across the {@code clearWarnings → convert → getWarnings}
+ * sequence. Do not share a single instance across threads. {@link SnowflakeTrinoTranslator}
+ * enforces the same constraint.
  */
 public class SnowflakeToTrinoConverter extends SqlShuttle {
 
@@ -57,8 +63,12 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
     /**
      * Registers (or replaces) a converter for the given Snowflake function name.
      * The name is matched case-insensitively at runtime (stored upper-cased here).
+     *
+     * @throws NullPointerException if either argument is null
      */
     public void register(String snowflakeName, FunctionConverter converter) {
+        Objects.requireNonNull(snowflakeName, "snowflakeName must not be null");
+        Objects.requireNonNull(converter, "converter must not be null");
         converters.put(snowflakeName.toUpperCase(), converter);
     }
 
@@ -453,12 +463,13 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
 
     /** TO_NUMBER / TO_NUMERIC / TO_DECIMAL → CAST(x AS DECIMAL) */
     private SqlNode convertToDecimal(SqlCall call) {
+        String name = call.getOperator().getName();
         if (call.operandCount() < 1) {
-            warn("TO_NUMBER", WarningType.ARGUMENT_DROPPED, "expects at least 1 operand, got " + call.operandCount());
+            warn(name, WarningType.ARGUMENT_DROPPED, "expects at least 1 operand, got " + call.operandCount());
             return call;
         }
         if (call.operandCount() > 1) {
-            warn("TO_NUMBER", WarningType.ARGUMENT_DROPPED, "precision/scale args not supported; using CAST(x AS DECIMAL)");
+            warn(name, WarningType.ARGUMENT_DROPPED, "precision/scale args not supported; using CAST(x AS DECIMAL)");
         }
         return buildCast(call.operand(0).accept(this), SqlTypeName.DECIMAL);
     }
@@ -483,12 +494,13 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
 
     /** TO_VARCHAR / TO_CHAR → CAST(x AS VARCHAR). Format arg dropped with warning. */
     private SqlNode convertToVarchar(SqlCall call) {
+        String name = call.getOperator().getName();
         if (call.operandCount() < 1) {
-            warn("TO_VARCHAR", WarningType.ARGUMENT_DROPPED, "expects at least 1 operand, got " + call.operandCount());
+            warn(name, WarningType.ARGUMENT_DROPPED, "expects at least 1 operand, got " + call.operandCount());
             return call;
         }
         if (call.operandCount() > 1) {
-            warn("TO_VARCHAR", WarningType.ARGUMENT_DROPPED, "format argument is not supported; dropped");
+            warn(name, WarningType.ARGUMENT_DROPPED, "format argument is not supported; dropped");
         }
         SqlDataTypeSpec varcharType = new SqlDataTypeSpec(
                 new SqlBasicTypeNameSpec(SqlTypeName.VARCHAR, SqlParserPos.ZERO),
@@ -894,15 +906,18 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
     /**
      * SQUARE(x) → x * x
      * Uses multiplication to preserve integer type; power(x, 2) returns DOUBLE in Trino.
-     * Note: if x has side effects (e.g. random()), it will be evaluated twice.
+     * The operand is accepted twice to produce two independent (but structurally equal) AST
+     * subtrees, avoiding shared-node aliasing in the output AST.
+     * Note: if x is non-deterministic (e.g. random()), it will be evaluated twice at runtime.
      */
     private SqlNode convertSquare(SqlCall call) {
         if (call.operandCount() != 1) {
             warn("SQUARE", WarningType.ARGUMENT_DROPPED, "expects 1 operand, got " + call.operandCount());
             return call;
         }
-        SqlNode operand = call.operand(0).accept(this);
-        return SqlStdOperatorTable.MULTIPLY.createCall(SqlParserPos.ZERO, operand, operand);
+        SqlNode left  = call.operand(0).accept(this);
+        SqlNode right = call.operand(0).accept(this);
+        return SqlStdOperatorTable.MULTIPLY.createCall(SqlParserPos.ZERO, left, right);
     }
 
     /** TRUNC(x) / TRUNC(x, scale) → truncate(x) / truncate(x, scale) */
@@ -1117,7 +1132,7 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
      */
     private SqlNode convertBoolXorAgg(SqlCall call) {
         if (call.operandCount() != 1) {
-            warn("BOOLXOR_AGG", WarningType.APPROXIMATE_TRANSLATION, "expects 1 operand, got " + call.operandCount());
+            warn("BOOLXOR_AGG", WarningType.ARGUMENT_DROPPED, "expects 1 operand, got " + call.operandCount());
             return call;
         }
         SqlNode countIf = buildFunction("count_if", call.operand(0).accept(this));
@@ -1237,11 +1252,14 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
     /**
      * RATIO_TO_REPORT(x) OVER (w) → x / SUM(x) OVER (w)
      * The same window clause is reused for the SUM.
+     * The operand is accepted twice to produce two independent AST subtrees for the dividend
+     * and the SUM argument, avoiding shared-node aliasing.
      */
     private SqlNode convertRatioToReport(SqlCall aggCall, SqlWindow window) {
-        SqlNode x = aggCall.operand(0).accept(this);
-        SqlNode sumCall = buildFunction("SUM", x);
-        SqlNode sumOver = SqlStdOperatorTable.OVER.createCall(SqlParserPos.ZERO, sumCall, window);
-        return SqlStdOperatorTable.DIVIDE.createCall(SqlParserPos.ZERO, x, sumOver);
+        SqlNode dividend  = aggCall.operand(0).accept(this);
+        SqlNode sumArg    = aggCall.operand(0).accept(this);
+        SqlNode sumCall   = buildFunction("SUM", sumArg);
+        SqlNode sumOver   = SqlStdOperatorTable.OVER.createCall(SqlParserPos.ZERO, sumCall, window);
+        return SqlStdOperatorTable.DIVIDE.createCall(SqlParserPos.ZERO, dividend, sumOver);
     }
 }

@@ -1,5 +1,7 @@
 package de.angelasensio.sftrino;
 
+import java.util.List;
+
 import org.apache.calcite.config.Lex;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.parser.SqlParseException;
@@ -13,6 +15,9 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Uses Apache Calcite's Babel parser to build an AST, transforms it via
  * {@link SnowflakeToTrinoConverter}, then renders it with {@link TrinoSqlDialect}.
+ *
+ * <p><b>Thread safety:</b> this class is <em>not</em> thread-safe. Create one instance per
+ * thread, or use external synchronization. See {@link SnowflakeToTrinoConverter} for details.
  *
  * <h3>Usage</h3>
  * <pre>{@code
@@ -46,8 +51,20 @@ public class SnowflakeTrinoTranslator {
     }
 
     /**
-     * Returns the underlying {@link SnowflakeToTrinoConverter}, allowing callers to register
-     * custom function converters via {@link SnowflakeToTrinoConverter#register(String, FunctionConverter)}.
+     * Registers (or replaces) a custom converter for the given Snowflake function name.
+     * This is the preferred extension point; callers do not need to import
+     * {@link SnowflakeToTrinoConverter} directly.
+     *
+     * @throws NullPointerException if either argument is null
+     */
+    public void register(String snowflakeName, FunctionConverter converter) {
+        this.converter.register(snowflakeName, converter);
+    }
+
+    /**
+     * Returns the underlying {@link SnowflakeToTrinoConverter}.
+     * Prefer {@link #register(String, FunctionConverter)} for adding custom converters.
+     * Use this accessor only when lower-level access (e.g. helper factories) is required.
      */
     public SnowflakeToTrinoConverter getConverter() {
         return converter;
@@ -95,7 +112,7 @@ public class SnowflakeTrinoTranslator {
             String trinoSql = transformedNode.toSqlString(trinoDialect).getSql();
             logger.debug("Translated Trino SQL: {}", trinoSql);
 
-            return new TranslationResult(trinoSql, converter.getWarnings());
+            return new TranslationResult(trinoSql, List.copyOf(converter.getWarnings()));
 
         } catch (SqlParseException e) {
             logger.error("Failed to parse Snowflake SQL", e);

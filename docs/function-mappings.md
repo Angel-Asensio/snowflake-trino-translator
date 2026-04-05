@@ -68,7 +68,7 @@
 | `REGEXP_SUBSTR(str, pattern, pos, occ, params)` | `regexp_extract(str, pattern)` | pos/occurrence/params dropped with warning |
 | `STRTOK(str, delim, part)` | `split_part(str, delim, part)` | All 3 operands required |
 | `EDITDISTANCE(s1, s2)` | `levenshtein_distance(s1, s2)` | |
-| `SPACE(n)` | `rpad('', n, ' ')` | `repeat(' ', n)` resolves to the array overload in Trino for char literals |
+| `SPACE(n)` | `rpad('', n, ' ')` | `repeat(' ', n)` resolves to the array overload in Trino; using `rpad` avoids ambiguity |
 
 ## Cryptographic / Encoding Functions
 

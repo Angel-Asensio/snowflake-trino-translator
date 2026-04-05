@@ -237,7 +237,7 @@ class FunctionMappingsIT extends IntegrationTestBase {
 
     @Test
     void testEndsWith() throws Exception {
-        // ENDSWITH(str, suffix) → ends_with(str, suffix)
+        // ENDSWITH(str, suffix) → substr(str, length(str)-length(suffix)+1) = suffix
         assertTranslatesAndMatches("SELECT ENDSWITH('hello world', 'world')");
     }
 
@@ -288,7 +288,7 @@ class FunctionMappingsIT extends IntegrationTestBase {
 
     @Test
     void testSpace() throws Exception {
-        // SPACE(n) → repeat(' ', n)
+        // SPACE(n) → rpad('', n, ' ')
         assertTranslatesAndMatches("SELECT SPACE(5)");
     }
 

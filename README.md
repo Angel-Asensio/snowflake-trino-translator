@@ -25,6 +25,8 @@ Produces a shaded JAR at `target/snowflake-trino-translator-1.0-SNAPSHOT.jar` wi
 
 ### Command Line
 
+The main entry point is `SnowflakeTrinoTranslatorCli`, which is configured in `pom.xml`.
+
 ```bash
 java -jar target/snowflake-trino-translator-1.0-SNAPSHOT.jar \
   "SELECT DATEADD(day, 7, created_at) FROM orders"
@@ -47,14 +49,27 @@ FROM "orders"
 SnowflakeTrinoTranslator translator = new SnowflakeTrinoTranslator();
 
 try {
+    // Simple translation: just the SQL string
     String trinoSql = translator.translate(snowflakeSql);
     System.out.println(trinoSql);
+    
+    // With diagnostics: SQL + warnings about dropped arguments or approximations
+    TranslationResult result = translator.translateWithDiagnostics(snowflakeSql);
+    System.out.println(result.sql());
+    if (result.hasWarnings()) {
+        result.warnings().forEach(w -> 
+            System.out.printf("  [%s] %s: %s%n", w.type(), w.functionName(), w.message()));
+    }
 } catch (SqlTranslationException e) {
     System.err.println("Translation failed: " + e.getMessage());
 }
 ```
 
-`translate()` throws `SqlTranslationException` (checked) on parse or transformation errors.
+**Methods:**
+
+- `translate(String)` — Convenience wrapper that returns only the translated SQL string. Throws `SqlTranslationException` (checked) on parse or transformation errors.
+- `translateWithDiagnostics(String)` — Returns a `TranslationResult` record containing the translated SQL and a `List<TranslationWarning>` of warnings about dropped arguments, approximate translations, or unsupported features.
+- `register(String functionName, FunctionConverter converter)` — Registers a custom converter for a Snowflake function. This is the preferred extension point for adding translations without modifying the library itself.
 
 ---
 
@@ -165,14 +180,14 @@ Input Snowflake SQL
 | `LEFT(str, n)` | `substr(str, 1, n)` | |
 | `RIGHT(str, n)` | `substr(str, length(str)-n+1, n)` | |
 | `STARTSWITH(str, prefix)` | `starts_with(str, prefix)` | |
-| `ENDSWITH(str, suffix)` | `substr(str, length(str)-length(suffix)+1) = suffix` | SQL-standard expression for compatibility with older Trino versions |
+| `ENDSWITH(str, suffix)` | `substr(str, length(str)-length(suffix)+1) = suffix` | Older Trino versions lack `ends_with()`; uses SQL-standard expression |
 | `CONTAINS(str, sub)` | `strpos(str, sub) > 0` | String containment; distinct from `ARRAY_CONTAINS` |
 | `INSTR(str, sub)` | `strpos(str, sub)` | |
 | `CHARINDEX(sub, str)` | `strpos(str, sub)` | Argument order reversed |
 | `REGEXP_SUBSTR(str, pat)` | `regexp_extract(str, pat)` | Extra args dropped with warning |
 | `STRTOK(str, delim, n)` | `split_part(str, delim, n)` | |
 | `EDITDISTANCE(s1, s2)` | `levenshtein_distance(s1, s2)` | |
-| `SPACE(n)` | `rpad('', n, ' ')` | `repeat(' ', n)` resolves to the array overload in Trino for char literals |
+| `SPACE(n)` | `rpad('', n, ' ')` | `repeat(' ', n)` resolves to the array overload in Trino; using `rpad` avoids ambiguity |
 
 ### Hash / Encoding
 
@@ -498,7 +513,28 @@ mvn test -Dtest=SnowflakeTrinoTranslatorTest#testDateAdd
 
 ## Adding New Translations
 
-1. Add a `case "FUNCTION_NAME":` branch in `SnowflakeToTrinoConverter.visit()`.
+### Using the Public API (Preferred)
+
+Register a custom converter without modifying the library:
+
+```java
+SnowflakeTrinoTranslator translator = new SnowflakeTrinoTranslator();
+translator.register("MY_FUNCTION", (call, ctx) -> {
+    if (call.operandCount() != 2) return call;
+    return ctx.buildFunction("trino_function_name",
+            call.operand(0).accept(ctx),
+            call.operand(1).accept(ctx));
+});
+String trinoSql = translator.translate(snowflakeSql);
+```
+
+This is the preferred approach for custom/proprietary Snowflake functions.
+
+### Modifying the Library
+
+To add a translation to the library itself:
+
+1. Add a `case "FUNCTION_NAME":` branch in `SnowflakeToTrinoConverter.visit()` or register via the converters map.
 2. Implement a private `convertFunctionName(SqlCall call)` method.
 3. Add a test in `SnowflakeTrinoTranslatorTest`.
 
