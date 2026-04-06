@@ -14,7 +14,7 @@
     <description>SQL translator from Snowflake to Trino using Apache Calcite</description>
 
     <properties>
-        <maven.compiler.release>21</maven.compiler.release>
+        <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <calcite.version>1.41.0</calcite.version>
         <slf4j.version>2.0.9</slf4j.version>

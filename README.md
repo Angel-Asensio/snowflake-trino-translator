@@ -4,7 +4,7 @@ Translates Snowflake SQL syntax to Trino-compatible SQL using Apache Calcite for
 
 ## Requirements
 
-- Java 23+
+- Java 17+
 - Maven 3.8+
 
 ## Build
