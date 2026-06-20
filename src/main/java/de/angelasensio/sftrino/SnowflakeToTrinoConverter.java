@@ -3,6 +3,7 @@ package de.angelasensio.sftrino;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -22,6 +23,7 @@ import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.SqlOperator;
+import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.SqlWindow;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
@@ -213,6 +215,12 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
             if ("RATIO_TO_REPORT".equals(aggName)) {
                 return convertRatioToReport(aggCall, (SqlWindow) call.operand(1));
             }
+            return super.visit(call);
+        }
+
+        // LCA expansion: resolve lateral column alias references before function conversion.
+        if (call.getKind() == SqlKind.SELECT) {
+            expandLateralColumnAliases((SqlSelect) call);
             return super.visit(call);
         }
 
@@ -1245,6 +1253,118 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
                 new SqlNodeList(List.of(SqlLiteral.createNull(SqlParserPos.ZERO)), SqlParserPos.ZERO),
                 formula
         );
+    }
+
+    // ── Lateral Column Alias (LCA) ───────────────────────────────────────────
+
+    /**
+     * Expands lateral column alias references in a SELECT node in-place, before function
+     * conversion runs. Snowflake allows a later SELECT item to reference an alias defined
+     * earlier in the same SELECT list; Trino does not support this.
+     *
+     * <p>Algorithm: walk the select list left-to-right, maintaining an {@code alias → expression}
+     * map of already-expanded expressions. When a later item contains a bare (unqualified)
+     * {@link SqlIdentifier} that matches a prior alias, substitute the recorded expression inline.
+     * The same map is used to substitute in the ORDER BY list.
+     *
+     * <p>Substitution is purely syntactic: only bare single-part identifiers are matched;
+     * qualified references (e.g. {@code t.x}) are left untouched. The expanded nodes still
+     * contain Snowflake function names — {@link #visit(SqlCall)} will convert them when
+     * {@code super.visit()} traverses the modified select list.
+     */
+    private void expandLateralColumnAliases(SqlSelect select) {
+        SqlNodeList selectList = select.getSelectList();
+        if (selectList == null || selectList.size() < 2) return;
+
+        Map<String, SqlNode> aliasMap = new LinkedHashMap<>();
+        List<SqlNode> updatedItems = new ArrayList<>(selectList.size());
+        boolean modified = false;
+
+        for (SqlNode item : selectList) {
+            String alias = null;
+            SqlNode expr = item;
+            SqlNode aliasNode = null;
+
+            if (item.getKind() == SqlKind.AS) {
+                SqlCall asCall = (SqlCall) item;
+                expr = asCall.operand(0);
+                aliasNode = asCall.operand(1);
+                if (aliasNode instanceof SqlIdentifier) {
+                    alias = ((SqlIdentifier) aliasNode).getSimple();
+                }
+            }
+
+            SqlNode expandedExpr = aliasMap.isEmpty() ? expr : substituteAliases(expr, aliasMap);
+
+            SqlNode newItem;
+            if (expandedExpr != expr) {
+                modified = true;
+                newItem = (aliasNode != null)
+                        ? SqlStdOperatorTable.AS.createCall(item.getParserPosition(), expandedExpr, aliasNode)
+                        : expandedExpr;
+            } else {
+                newItem = item;
+            }
+            updatedItems.add(newItem);
+
+            if (alias != null) {
+                aliasMap.put(alias.toUpperCase(), expandedExpr);
+            }
+        }
+
+        if (modified) {
+            List<SqlNode> rawList = selectList.getList();
+            for (int i = 0; i < updatedItems.size(); i++) {
+                rawList.set(i, updatedItems.get(i));
+            }
+        }
+
+        // Substitute aliases in ORDER BY (handles cases like ORDER BY alias_expr + 1)
+        SqlNodeList orderBy = select.getOrderList();
+        if (orderBy != null && !aliasMap.isEmpty()) {
+            List<SqlNode> orderRaw = orderBy.getList();
+            for (int i = 0; i < orderRaw.size(); i++) {
+                SqlNode orderItem = orderRaw.get(i);
+                SqlNode expanded = substituteAliases(orderItem, aliasMap);
+                if (expanded != orderItem) {
+                    modified = true;
+                    orderRaw.set(i, expanded);
+                }
+            }
+        }
+
+        if (modified) {
+            warn("LATERAL_COLUMN_ALIAS", WarningType.LATERAL_COLUMN_ALIAS_REWRITE,
+                    "lateral column alias references expanded via inline substitution");
+        }
+    }
+
+    private SqlNode substituteAliases(SqlNode node, Map<String, SqlNode> aliasMap) {
+        return node.accept(new AliasSubstitutionShuttle(aliasMap));
+    }
+
+    /**
+     * Replaces bare (unqualified) {@link SqlIdentifier} nodes whose name matches a key in
+     * {@code aliasMap} with the corresponding expression. Qualified references (e.g. {@code t.x})
+     * are left untouched to avoid incorrectly substituting real column references.
+     */
+    private static final class AliasSubstitutionShuttle extends SqlShuttle {
+        private final Map<String, SqlNode> aliasMap;
+
+        AliasSubstitutionShuttle(Map<String, SqlNode> aliasMap) {
+            this.aliasMap = aliasMap;
+        }
+
+        @Override
+        public SqlNode visit(SqlIdentifier id) {
+            if (id.isSimple()) {
+                SqlNode replacement = aliasMap.get(id.getSimple().toUpperCase());
+                if (replacement != null) {
+                    return replacement;
+                }
+            }
+            return id;
+        }
     }
 
     // ── Window converter ─────────────────────────────────────────────────────

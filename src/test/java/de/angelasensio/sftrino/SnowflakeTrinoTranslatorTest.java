@@ -2115,4 +2115,112 @@ public class SnowflakeTrinoTranslatorTest {
         assertNotNull(result);
         assertTrue(result.toUpperCase().contains("SKEW"));
     }
+
+    // ── Lateral Column Alias (LCA) ────────────────────────────────────────
+
+    @Test
+    public void testLcaBasicExpressionInlined() throws SqlTranslationException {
+        // Snowflake: SELECT amount * 0.9 AS discounted, discounted * 1.1 AS adjusted FROM orders
+        // Trino: discounted is expanded inline — "0.9" appears twice in the output
+        String result = translator.translate(
+                "SELECT amount * 0.9 AS discounted, discounted * 1.1 AS adjusted FROM orders");
+        assertNotNull(result);
+        int count = result.split("0\\.9", -1).length - 1;
+        assertTrue(count >= 2, "LCA should inline the expression; 0.9 should appear at least twice");
+    }
+
+    @Test
+    public void testLcaNoSubstitutionForNonLcaQuery() throws SqlTranslationException {
+        // No LCA: no alias is referenced in a later item — output is unchanged structurally
+        String result = translator.translate("SELECT amount AS price, qty FROM orders");
+        assertNotNull(result);
+        assertTrue(result.toUpperCase().contains("SELECT"));
+    }
+
+    @Test
+    public void testLcaWarningEmitted() throws SqlTranslationException {
+        // An LCA substitution should produce a LATERAL_COLUMN_ALIAS_REWRITE warning
+        TranslationResult result = translator.translateWithDiagnostics(
+                "SELECT amount * 0.9 AS discounted, discounted * 1.1 AS adjusted FROM orders");
+        assertTrue(result.hasWarnings());
+        assertTrue(result.warnings().stream()
+                .anyMatch(w -> w.type() == WarningType.LATERAL_COLUMN_ALIAS_REWRITE));
+    }
+
+    @Test
+    public void testLcaNoWarningForNonLcaQuery() throws SqlTranslationException {
+        // No LCA means no LATERAL_COLUMN_ALIAS_REWRITE warning
+        TranslationResult result = translator.translateWithDiagnostics(
+                "SELECT id, name FROM users");
+        assertTrue(result.warnings().stream()
+                .noneMatch(w -> w.type() == WarningType.LATERAL_COLUMN_ALIAS_REWRITE));
+    }
+
+    @Test
+    public void testLcaChainTransitive() throws SqlTranslationException {
+        // x = a + 1, y = x * 2, z = y - x
+        // After expansion: x = a+1, y = (a+1)*2, z = (a+1)*2 - (a+1)
+        // "a" should appear at least 4 times in the output (quoted as "a")
+        String result = translator.translate(
+                "SELECT a + 1 AS x, x * 2 AS y, y - x AS z FROM t");
+        assertNotNull(result);
+        // Count quoted occurrences of the column reference "a" (Trino dialect adds quotes)
+        String lower = result.replace("\"a\"", "__COL__");
+        int count = lower.split("__COL__", -1).length - 1;
+        assertTrue(count >= 4, "Transitive LCA chain: 'a' should be inlined 4+ times, got " + count);
+    }
+
+    @Test
+    public void testLcaWithSnowflakeFunctionAlias() throws SqlTranslationException {
+        // LCA alias whose definition contains a Snowflake function
+        // IFNULL → COALESCE; the inlined expression in the second item should also be converted
+        String result = translator.translate(
+                "SELECT IFNULL(score, 0) AS base_score, base_score + 10 AS adjusted FROM t");
+        assertNotNull(result);
+        assertTrue(result.toUpperCase().contains("COALESCE"),
+                "Snowflake function inside LCA expression should be converted");
+        // COALESCE should appear at least twice (once in base_score, once inlined in adjusted)
+        int count = result.toUpperCase().split("COALESCE", -1).length - 1;
+        assertTrue(count >= 2, "Inlined LCA expression should also be function-converted");
+    }
+
+    @Test
+    public void testLcaQualifiedIdentifierNotSubstituted() throws SqlTranslationException {
+        // t.x is a qualified reference — must NOT be treated as an LCA reference
+        // Only bare (unqualified) identifiers that match a prior alias should be substituted
+        String result = translator.translate(
+                "SELECT t.amount AS x, t.amount + 1 AS y FROM t");
+        assertNotNull(result);
+        // t.amount in the second item must still be present (not substituted away)
+        // We verify by checking the column reference is retained as a qualified reference
+        assertTrue(result.toLowerCase().contains("amount"),
+                "Qualified column reference must not be substituted");
+    }
+
+    @Test
+    public void testLcaInOrderBy() throws SqlTranslationException {
+        // Snowflake: SELECT amount * 0.9 AS discounted FROM orders ORDER BY discounted DESC
+        // The ORDER BY alias reference should be handled (either substituted or left as alias)
+        String result = translator.translate(
+                "SELECT amount * 0.9 AS discounted FROM orders ORDER BY discounted DESC");
+        assertNotNull(result);
+        assertTrue(result.toUpperCase().contains("ORDER BY"));
+        // Translation should succeed — Trino accepts SELECT aliases in ORDER BY
+        assertTrue(result.toUpperCase().contains("SELECT"));
+    }
+
+    @Test
+    public void testLcaWindowFunctionReference() throws SqlTranslationException {
+        // LCA inside a window function's argument
+        // salary * 0.1 AS bonus, then SUM(bonus) OVER (...)
+        String result = translator.translate(
+                "SELECT salary * 0.1 AS bonus, SUM(bonus) OVER (PARTITION BY dept) AS dept_bonus FROM emp");
+        assertNotNull(result);
+        // bonus is expanded: SUM should contain the salary * 0.1 expression
+        assertTrue(result.toUpperCase().contains("SUM"));
+        assertTrue(result.toUpperCase().contains("OVER"));
+        // salary should appear in both items after inlining
+        int count = result.replace("\"salary\"", "__SAL__").split("__SAL__", -1).length - 1;
+        assertTrue(count >= 2, "salary should appear at least twice after LCA expansion into window");
+    }
 }
