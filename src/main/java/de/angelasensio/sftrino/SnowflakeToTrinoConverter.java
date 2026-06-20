@@ -5,6 +5,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
@@ -71,7 +72,7 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
     public void register(String snowflakeName, FunctionConverter converter) {
         Objects.requireNonNull(snowflakeName, "snowflakeName must not be null");
         Objects.requireNonNull(converter, "converter must not be null");
-        converters.put(snowflakeName.toUpperCase(), converter);
+        converters.put(snowflakeName.toUpperCase(Locale.ROOT), converter);
     }
 
     private void initConverters() {
@@ -204,14 +205,14 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
     @Override
     public SqlNode visit(SqlCall call) {
         SqlOperator operator = call.getOperator();
-        String functionName = operator.getName().toUpperCase();
+        String functionName = operator.getName().toUpperCase(Locale.ROOT);
 
         logger.debug("Visiting function call: {}", functionName);
 
         // Window call: intercept before registry lookup so we can inspect the inner aggregate.
         if ("OVER".equals(functionName)) {
             SqlCall aggCall = (SqlCall) call.operand(0);
-            String aggName = aggCall.getOperator().getName().toUpperCase();
+            String aggName = aggCall.getOperator().getName().toUpperCase(Locale.ROOT);
             if ("RATIO_TO_REPORT".equals(aggName)) {
                 return convertRatioToReport(aggCall, (SqlWindow) call.operand(1));
             }
@@ -1265,12 +1266,13 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
      * <p>Algorithm: walk the select list left-to-right, maintaining an {@code alias → expression}
      * map of already-expanded expressions. When a later item contains a bare (unqualified)
      * {@link SqlIdentifier} that matches a prior alias, substitute the recorded expression inline.
-     * The same map is used to substitute in the ORDER BY list.
+     * ORDER BY is left untouched — Trino resolves SELECT aliases in ORDER BY natively.
      *
      * <p>Substitution is purely syntactic: only bare single-part identifiers are matched;
-     * qualified references (e.g. {@code t.x}) are left untouched. The expanded nodes still
-     * contain Snowflake function names — {@link #visit(SqlCall)} will convert them when
-     * {@code super.visit()} traverses the modified select list.
+     * qualified references (e.g. {@code t.x}) are left untouched, and the shuttle does not
+     * descend into subqueries. The expanded nodes still contain Snowflake function names —
+     * {@link #visit(SqlCall)} will convert them when {@code super.visit()} traverses the
+     * modified select list.
      */
     private void expandLateralColumnAliases(SqlSelect select) {
         SqlNodeList selectList = select.getSelectList();
@@ -1308,32 +1310,12 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
             updatedItems.add(newItem);
 
             if (alias != null) {
-                aliasMap.put(alias.toUpperCase(), expandedExpr);
+                aliasMap.put(alias.toUpperCase(Locale.ROOT), expandedExpr);
             }
         }
 
         if (modified) {
-            List<SqlNode> rawList = selectList.getList();
-            for (int i = 0; i < updatedItems.size(); i++) {
-                rawList.set(i, updatedItems.get(i));
-            }
-        }
-
-        // Substitute aliases in ORDER BY (handles cases like ORDER BY alias_expr + 1)
-        SqlNodeList orderBy = select.getOrderList();
-        if (orderBy != null && !aliasMap.isEmpty()) {
-            List<SqlNode> orderRaw = orderBy.getList();
-            for (int i = 0; i < orderRaw.size(); i++) {
-                SqlNode orderItem = orderRaw.get(i);
-                SqlNode expanded = substituteAliases(orderItem, aliasMap);
-                if (expanded != orderItem) {
-                    modified = true;
-                    orderRaw.set(i, expanded);
-                }
-            }
-        }
-
-        if (modified) {
+            select.setSelectList(new SqlNodeList(updatedItems, selectList.getParserPosition()));
             warn("LATERAL_COLUMN_ALIAS", WarningType.LATERAL_COLUMN_ALIAS_REWRITE,
                     "lateral column alias references expanded via inline substitution");
         }
@@ -1346,7 +1328,8 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
     /**
      * Replaces bare (unqualified) {@link SqlIdentifier} nodes whose name matches a key in
      * {@code aliasMap} with the corresponding expression. Qualified references (e.g. {@code t.x})
-     * are left untouched to avoid incorrectly substituting real column references.
+     * are left untouched. Recursion stops at subquery boundaries to avoid substituting
+     * identifiers that are scoped to the inner query.
      */
     private static final class AliasSubstitutionShuttle extends SqlShuttle {
         private final Map<String, SqlNode> aliasMap;
@@ -1356,9 +1339,18 @@ public class SnowflakeToTrinoConverter extends SqlShuttle {
         }
 
         @Override
+        public SqlNode visit(SqlCall call) {
+            // Identifiers inside a subquery are scoped to that query — don't substitute.
+            if (call.getKind() == SqlKind.SELECT) {
+                return call;
+            }
+            return super.visit(call);
+        }
+
+        @Override
         public SqlNode visit(SqlIdentifier id) {
             if (id.isSimple()) {
-                SqlNode replacement = aliasMap.get(id.getSimple().toUpperCase());
+                SqlNode replacement = aliasMap.get(id.getSimple().toUpperCase(Locale.ROOT));
                 if (replacement != null) {
                     return replacement;
                 }

@@ -2223,4 +2223,17 @@ public class SnowflakeTrinoTranslatorTest {
         int count = result.replace("\"salary\"", "__SAL__").split("__SAL__", -1).length - 1;
         assertTrue(count >= 2, "salary should appear at least twice after LCA expansion into window");
     }
+
+    @Test
+    public void testLcaDoesNotCrossSubqueryBoundary() throws SqlTranslationException {
+        // The bare 'x' inside (SELECT x FROM t2) is t2.x, not the outer alias x = a + 1.
+        // AliasSubstitutionShuttle must stop at subquery boundaries.
+        String result = translator.translate(
+                "SELECT a + 1 AS x, (SELECT x FROM t2) AS y FROM t1");
+        assertNotNull(result);
+        // Without the fix, the outer 'a + 1' would be inlined into the subquery, making 'a'
+        // appear twice. With the fix it appears exactly once (in the outer SELECT item).
+        int aCount = result.replace("\"a\"", "__A__").split("__A__", -1).length - 1;
+        assertEquals(1, aCount, "Outer alias expression must not be inlined into the subquery");
+    }
 }
