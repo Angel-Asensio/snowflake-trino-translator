@@ -2,6 +2,8 @@
 
 Translates Snowflake SQL syntax to Trino-compatible SQL using Apache Calcite for AST-based parsing and transformation. Unlike regex-based approaches, this library parses the full SQL grammar into an abstract syntax tree, transforms Snowflake-specific constructs, and regenerates valid Trino SQL — preserving query structure and semantics.
 
+Beyond function-level translation, it also performs query-level rewrites such as **lateral column alias (LCA)** expansion — resolving SELECT-list aliases that are referenced by later items in the same SELECT, which Snowflake permits but Trino does not.
+
 ## Requirements
 
 - Java 17+
@@ -264,6 +266,26 @@ Input Snowflake SQL
 
 Standard SQL window functions (`RANK`, `DENSE_RANK`, `ROW_NUMBER`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `CUME_DIST`, `PERCENT_RANK`) and aggregate window functions (`AVG`, `SUM`, `MIN`, `MAX`, `COUNT` with `OVER`) pass through unchanged.
 
+### Query-Level Rewrites
+
+#### Lateral Column Alias (LCA)
+
+Snowflake lets a SELECT item reference an alias defined **earlier in the same SELECT list** (and in `ORDER BY`). Trino has no such feature — alias references must be expanded to the underlying expression. The translator detects these references and inlines the aliased expression at every use site.
+
+| Snowflake | Trino | Notes |
+|-----------|-------|-------|
+| `SELECT a * 0.9 AS d, d * 1.1 AS adj` | `SELECT a * 0.9 AS d, a * 0.9 * 1.1 AS adj` | Alias `d` expanded inline at its reference |
+
+Behavior:
+
+- **Transitive chains** are resolved — an alias that itself references a prior alias is fully expanded (`x → y → z`).
+- **Snowflake functions inside an aliased expression are still converted** after inlining (e.g. an inlined `IFNULL(...)` becomes `COALESCE(...)`).
+- **References inside window functions** (`OVER (...)`) are expanded too.
+- **Qualified references are never substituted** — `t.x` is treated as a real column reference, not an alias, even if a prior item is aliased `x`.
+- Each rewrite emits a `LATERAL_COLUMN_ALIAS_REWRITE` warning so callers can audit where inlining happened.
+
+Note: because the same expression is duplicated at each reference, it is evaluated multiple times in Trino. This is semantically equivalent but may have a performance cost for expensive expressions.
+
 ### Pass-through (no translation needed)
 
 These functions have identical syntax in both dialects and pass through unchanged:
@@ -478,6 +500,74 @@ SELECT
 FROM "sales_data";
 ```
 
+### Lateral column alias (LCA)
+
+A later SELECT item referencing an alias defined earlier in the same SELECT — supported in Snowflake, rewritten by inline expansion for Trino.
+
+```sql
+-- Snowflake
+SELECT
+  amount * 0.9      AS discounted,
+  discounted * 1.1  AS adjusted
+FROM orders;
+
+-- Trino  (discounted is expanded inline)
+SELECT
+  "amount" * 0.9         AS "discounted",
+  "amount" * 0.9 * 1.1   AS "adjusted"
+FROM "orders";
+```
+
+Transitive chains are fully resolved, and Snowflake functions inside an aliased expression are still converted after inlining:
+
+```sql
+-- Snowflake
+SELECT
+  a + 1     AS x,
+  x * 2     AS y,
+  y - x     AS z
+FROM t;
+
+-- Trino
+SELECT
+  "a" + 1                            AS "x",
+  ("a" + 1) * 2                      AS "y",
+  ("a" + 1) * 2 - ("a" + 1)          AS "z"
+FROM "t";
+```
+
+```sql
+-- Snowflake: alias whose definition uses a Snowflake function, referenced later
+SELECT
+  IFNULL(score, 0)    AS base_score,
+  base_score + 10     AS adjusted
+FROM t;
+
+-- Trino: IFNULL → COALESCE, and the inlined copy is converted too
+SELECT
+  COALESCE("score", 0)        AS "base_score",
+  COALESCE("score", 0) + 10   AS "adjusted"
+FROM "t";
+```
+
+LCA references inside window functions are expanded as well:
+
+```sql
+-- Snowflake
+SELECT
+  salary * 0.1                          AS bonus,
+  SUM(bonus) OVER (PARTITION BY dept)   AS dept_bonus
+FROM emp;
+
+-- Trino
+SELECT
+  "salary" * 0.1                                  AS "bonus",
+  SUM("salary" * 0.1) OVER (PARTITION BY "dept")  AS "dept_bonus"
+FROM "emp";
+```
+
+Each LCA rewrite emits a `LATERAL_COLUMN_ALIAS_REWRITE` warning, visible via `translateWithDiagnostics`.
+
 ---
 
 ## Running Tests
@@ -508,6 +598,7 @@ mvn test -Dtest=SnowflakeTrinoTranslatorTest#testDateAdd
 - **`BOOLXOR_AGG`** — Translated as `(count_if(x) % 2) = 1`. This is semantically equivalent but produces a `boolean` expression, not a standalone aggregate call, which may affect how you reference it in outer queries.
 - **Semi-structured / variant data** — Snowflake's colon-path syntax (`col:field`), `GET_PATH`, `OBJECT_CONSTRUCT`, and similar variant functions are not handled.
 - **Identifier quoting** — All identifiers in the output are double-quoted. This is valid Trino syntax but may look verbose.
+- **Lateral column alias (LCA) expansion** — Alias references are resolved by *inline substitution*, so an aliased expression is duplicated at every reference and evaluated multiple times by Trino. This is semantically equivalent but can be costly for expensive expressions. Substitution is purely syntactic: only bare, unqualified identifiers matching a prior alias are replaced; qualified references (`t.x`) are left untouched.
 
 ---
 
